@@ -11,7 +11,7 @@ no-rebuild promote step. A second template serves a static site from a private S
 | Built with | AWS CodePipeline, CodeBuild, ECR, S3, CloudFront, CloudFormation, IAM, Maven, JUnit 5, JaCoCo, SonarQube, Docker, GitHub Actions |
 | App | a tiny Java 17 HTTP service (`/health`, `/greet`) with unit and HTTP tests; it exists only to give the pipeline something real to build |
 | Environments | `dev`, `stage`, `prod`: one stack each, mapped to `develop`, `release`, `main` (see [docs/BRANCHING.md](docs/BRANCHING.md)) |
-| Status | **written and statically checked; not yet deployed to a real AWS account** (details below) |
+| Status | **`dev` deployed and run once in my own AWS account (ap-south-1), then torn down**; the SonarQube gate, `stage` and the `prod` approval and promote were not run on AWS (details below) |
 
 ## How it flows
 ```mermaid
@@ -50,10 +50,18 @@ Done in this repository:
 - The Java code compiles, and the greeting logic and both HTTP endpoints were exercised by hand against a running instance.
 - The shell scripts pass `bash -n` (syntax only).
 
-**Not done yet:**
-- The Maven/JUnit suite runs in the GitHub Actions `test` job, and it passes there. I could not run it on my own machine while building, because Maven Central was unreachable from that environment.
-- Nothing has been deployed to AWS, so the pipeline, the SonarQube gate, the ECR push, the approval stage and the CloudFront site have not run for real.
+**Run for real on AWS (`dev`, 26 Nov 2026, commit `18e0a7d`):**
+- `scripts/deploy.sh dev` created both stacks, `greeter-pipeline-dev` and `greeter-site-dev`, and both reached `CREATE_COMPLETE`.
+- The `greeter-dev` pipeline ran Source and BuildAndTest to green. The CodeBuild run took about a minute and its unit-test report shows 6 of 6 tests passed.
+- The build pushed an image tagged `dev-18e0a7d6` to the ECR repository, and the CloudFront URL served the static site.
+- `scripts/destroy.sh dev` then removed both stacks, and its leftover check for the pipeline, ECR repository and CloudFront distribution came back empty.
+
+**Not run on AWS:**
+- The SonarQube quality gate. `SONAR_HOST_URL` was left empty, so the build skipped that step by design. The same gate was run locally in [jenkins-maven-docker-pipeline](https://github.com/dineshravichandiran/jenkins-maven-docker-pipeline).
+- The `stage` and `prod` environments, the `prod` manual approval and the no-rebuild promote step.
+- A custom domain with Route 53 and ACM. The site uses the default CloudFront domain and certificate.
 - The branch-protection rules in `docs/BRANCHING.md` are a recommendation, not something this repo enforces.
+- The Maven/JUnit suite also runs in the GitHub Actions `test` job and passes there. I could not run it on my own machine while building, because Maven Central was unreachable from that environment.
 
 ## Run it on your own account
 Cost is small but not zero: CodePipeline V2 bills per action-minute after the free allowance, CodeBuild bills per build minute, CloudFront and S3 cost cents for a demo, and ECR charges for stored images. Set a budget alarm first, and run `scripts/destroy.sh` when done.
