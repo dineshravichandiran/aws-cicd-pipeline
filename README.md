@@ -51,7 +51,7 @@ Done in this repository:
 - The shell scripts pass `bash -n` (syntax only).
 
 **Not done yet:**
-- The Maven/JUnit suite has not been run by me: the environment I built this in could not reach Maven Central. It runs in the GitHub Actions `test` job.
+- The Maven/JUnit suite runs in the GitHub Actions `test` job, and it passes there. I could not run it on my own machine while building, because Maven Central was unreachable from that environment.
 - Nothing has been deployed to AWS, so the pipeline, the SonarQube gate, the ECR push, the approval stage and the CloudFront site have not run for real.
 - The branch-protection rules in `docs/BRANCHING.md` are a recommendation, not something this repo enforces.
 
