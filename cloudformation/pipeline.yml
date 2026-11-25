@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CI/CD for the greeter app: ECR repository, CodeBuild (test, SonarQube gate, image build and push) and
+  CodePipeline. One stack per environment; prod adds a manual approval and a promote step.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, stage, prod]
+    Description: Which environment this stack serves. Also decides whether the approval and promote stages exist.
+  GitHubOwner:
+    Type: String
+    Default: dineshravichandiran
+  GitHubRepo:
+    Type: String
+    Default: aws-cicd-pipeline
+  Branch:
+    Type: String
+    Description: "Branch this pipeline watches (branching strategy: dev=develop, stage=release, prod=main)."
+  ConnectionArn:
+    Type: String
+    Description: ARN of an AWS CodeConnections (CodeStar) connection to GitHub. Create it once in the console and authorize it.
+    AllowedPattern: "arn:aws:(codestar-connections|codeconnections):.+"
+  SonarHostUrl:
+    Type: String
+    Default: ""
+    Description: SonarQube server URL. Leave empty to skip the quality gate.
+  SonarTokenSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager secret ARN holding the SonarQube token. Required when SonarHostUrl is set.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  UseSonar: !And
+    - !Not [!Equals [!Ref SonarHostUrl, ""]]
+    - !Not [!Equals [!Ref SonarTokenSecretArn, ""]]
+
+Resources:
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub "greeter-${Environment}"
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS   # AWS managed key (alias/aws/ecr), no extra cost
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the last 20 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+          "action":{"type":"expire"}}]}
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Short-lived pipeline artifacts (30-day expiry), private, TLS-only and versioned; access logs add a second bucket for no audit value here"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub "${ArtifactBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs are encrypted at rest by default; a customer-managed KMS key adds a monthly cost for a lab"
+    Properties:
+      LogGroupName: !Sub "/codebuild/greeter-${Environment}"
+      RetentionInDays: 30
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${BuildLogGroup.Arn}:*"
+              - Sid: Artifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !GetAtt ImageRepository.Arn
+              - Sid: Reports
+                Effect: Allow
+                Action: [codebuild:CreateReportGroup, codebuild:CreateReport, codebuild:UpdateReport, codebuild:BatchPutTestCases]
+                Resource: !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/greeter-${Environment}-*"
+        - !If
+          - UseSonar
+          - PolicyName: sonar-token
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref SonarTokenSecretArn
+          - !Ref AWS::NoValue
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "greeter-${Environment}-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: {Type: CODEPIPELINE}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: ECR_REPO_URI, Value: !GetAtt ImageRepository.RepositoryUri}
+          - {Name: ENVIRONMENT, Value: !Ref Environment}
+          - {Name: SONAR_HOST_URL, Value: !Ref SonarHostUrl}
+          - !If
+            - UseSonar
+            - {Name: SONAR_TOKEN, Type: SECRETS_MANAGER, Value: !Ref SonarTokenSecretArn}
+            - !Ref AWS::NoValue
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      TimeoutInMinutes: 20
+
+  PromoteProject:
+    Type: AWS::CodeBuild::Project
+    Condition: IsProd
+    Properties:
+      Name: !Sub "greeter-${Environment}-promote"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: {Type: CODEPIPELINE}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-promote.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: ECR_REPO_URI, Value: !GetAtt ImageRepository.RepositoryUri}
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      TimeoutInMinutes: 10
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codepipeline.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !If [IsProd, !GetAtt PromoteProject.Arn, !GetAtt BuildProject.Arn]
+              - Effect: Allow
+                Action: [codestar-connections:UseConnection, codeconnections:UseConnection]
+                Resource: !Ref ConnectionArn
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "greeter-${Environment}"
+      RoleArn: !GetAtt PipelineRole.Arn
+      PipelineType: V2
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1"}
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
+                BranchName: !Ref Branch
+                DetectChanges: "true"
+              OutputArtifacts: [{Name: SourceOutput}]
+        - Name: BuildAndTest
+          Actions:
+            - Name: MavenSonarDocker
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts: [{Name: SourceOutput}]
+              OutputArtifacts: [{Name: BuildOutput}]
+        - !If
+          - IsProd
+          - Name: Approval
+            Actions:
+              - Name: ManualApproval
+                ActionTypeId: {Category: Approval, Owner: AWS, Provider: Manual, Version: "1"}
+                Configuration:
+                  CustomData: Review the image in ECR and the SonarQube result, then approve to promote.
+          - !Ref AWS::NoValue
+        - !If
+          - IsProd
+          - Name: Promote
+            Actions:
+              - Name: RetagImage
+                ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+                Configuration:
+                  ProjectName: !Ref PromoteProject
+                InputArtifacts: [{Name: BuildOutput}]
+          - !Ref AWS::NoValue
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt ImageRepository.RepositoryUri
+  PipelineName:
+    Value: !Ref Pipeline

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>greeter: delivered by the pipeline</title>
+  <style>
+    body{font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#1b1f23}
+    code{background:#f0f2f4;padding:.1rem .3rem;border-radius:3px}
+  </style>
+</head>
+<body>
+  <h1>greeter</h1>
+  <p>This page is served from a private S3 bucket through CloudFront (origin access control, HTTPS only).</p>
+  <p>The app it belongs to is built, tested and pushed to ECR by CodePipeline and CodeBuild.</p>
+</body>
+</html>

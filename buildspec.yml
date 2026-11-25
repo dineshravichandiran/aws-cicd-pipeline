@@ -1,0 +1,37 @@
+version: 0.2
+
+# CodeBuild: test, quality-gate, build the image, push to ECR.
+# Env vars come from cloudformation/pipeline.yml:
+#   ECR_REPO_URI, ENVIRONMENT, SONAR_HOST_URL (empty = skip SonarQube), SONAR_TOKEN (Secrets Manager, optional)
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+  pre_build:
+    commands:
+      - export COMMIT_SHA="$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-8)"
+      - export IMAGE_TAG="${ENVIRONMENT}-${COMMIT_SHA}"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${ECR_REPO_URI%%/*}"
+  build:
+    commands:
+      - cd app && mvn -B -ntp verify && cd ..
+      - |
+        if [ -n "$SONAR_HOST_URL" ] && [ -n "$SONAR_TOKEN" ]; then
+          mvn -B -ntp -f app/pom.xml org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.host.url="$SONAR_HOST_URL" -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.projectKey=greeter -Dsonar.qualitygate.wait=true
+        else
+          echo "SonarQube not configured: skipping the quality gate"
+        fi
+      - docker build --build-arg APP_VERSION="$IMAGE_TAG" -t "$ECR_REPO_URI:$IMAGE_TAG" app
+  post_build:
+    commands:
+      - docker push "$ECR_REPO_URI:$IMAGE_TAG"
+      - printf '{"imageTag":"%s","repository":"%s"}' "$IMAGE_TAG" "$ECR_REPO_URI" > image.json
+reports:
+  unit-tests:
+    files: ["app/target/surefire-reports/*.xml"]
+    file-format: JUNITXML
+artifacts:
+  files:
+    - image.json
